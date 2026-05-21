@@ -1,4 +1,18 @@
-// LegacyBot v0.39 — Storage overflow detection and aggressive storage targets.
+// LegacyBot v0.40 — Land-saturation detection + explorer boost.
+//
+// What's new vs v0.39:
+//   NNN. findBottleneck('land') now returns wanderer as the bottleneck-producer
+//        when land.used >= amount × 0.9. Previously land was always returning
+//        null (no producers in catalog, no net-negative — it's expanded via
+//        the `explore` effect outside the normal producer model).
+//   OOO. computeTier2Targets boosts wanderer/scout fraction from 1% to 5% of
+//        pop when land is saturated. At pop 500 that's 25 explorers each
+//        instead of 5, dramatically faster tile-discovery.
+//   PPP. Combined effect: when storage overflows (v0.39) but no free land
+//        exists, the bot now also pushes exploration to UNLOCK that storage
+//        construction. Without this, storage detection alone was a no-op.
+//
+// What v0.39 brought (still here):
 //
 // What's new vs v0.38:
 //   KKK. Storage-overflow detection: any resource whose name contains 'storage'
@@ -432,7 +446,7 @@
 
   // ─── Bot ─────────────────────────────────────────────────────────────
   const Bot = {
-    version: '0.39',
+    version: '0.40',
     G: G,
     objective: 'tier-1 survival first, then QoL, then infrastructure',
 
@@ -736,7 +750,13 @@
       for (const n of happinessUnits) allot(n, perHappiness);
       const perTech = Math.max(1, Math.ceil(pop * 0.05 / techProducers.length));
       for (const n of techProducers) allot(n, perTech);
-      for (const n of explorers) allot(n, Math.max(1, Math.ceil(pop * 0.01)));
+      // v0.40: when land is saturated, boost explorer count 10× so the bot
+      // pushes hard to find new tiles. Each wanderer reveals 0.1 tile/tick;
+      // without aggressive scaling at pop 500 the bot only targets 5 explorers.
+      const landRes2 = r.land;
+      const landSaturated = landRes2 && landRes2.amount > 0 && landRes2.used >= landRes2.amount * 0.9;
+      const explorerFrac = landSaturated ? 0.05 : 0.01;
+      for (const n of explorers) allot(n, Math.max(1, Math.ceil(pop * explorerFrac)));
       for (const n of civil) allot(n, 1);
       return targets;
     },
@@ -1617,6 +1637,13 @@
           if (sub) return Object.assign({}, sub, { essential: essentialName, kind: 'cap-chain' });
           return { essential: essentialName, resource: capLimit, kind: 'cap-saturated', severity: 'high', why: `${essentialName} capped at ${capLimit}` };
         }
+      }
+      // v0.40: land-saturation check — land has no producers in catalog (the
+      // game expands it via `explore` effect on wanderer/scout). When fully
+      // used, no buildings can be queued, blocking storage / housing / production.
+      // Returns wanderer as the bottleneck-producer so explorers get tier-3 weight.
+      if (essentialName === 'land' && res.amount > 0 && res.used >= res.amount * 0.9) {
+        return { essential: 'land', resource: 'wanderer', kind: 'land-saturated', severity: 'high', producer: 'wanderer', why: `land ${res.used}/${res.amount} fully used — need more wanderers/scouts to explore` };
       }
       // Step 2: net-negative?
       const net = (res.gained || 0) - (res.lost || 0);
