@@ -1,4 +1,17 @@
-// LegacyBot v0.40 — Land-saturation detection + explorer boost.
+// LegacyBot v0.41 — Food throttle inversion fix (was a CAP that acted as FLOOR).
+//
+// What's new vs v0.40:
+//   QQQ. The v0.11 stockpile-aware food throttle was supposed to REDUCE food
+//        workers when food was overstocked. At pop ~500 with `pop × 0.10 = 50`
+//        gatherers it worked correctly. But at pop 5000, `pop × 0.10 = 500`
+//        gatherers — far MORE than the consumption-based foodQuota of ~119.
+//        Math.max(floor, pop × 0.10) selected 500, INFLATING food workers.
+//        Tier-1 then ate 87% of the worker pool (2498/2861), starving tier-2.
+//        Now Math.max(floor, Math.min(current_target, pop × 0.10)) — takes
+//        the LOWER of original quota and throttle cap, so the throttle is
+//        only ever a reduction, never an inflation.
+//
+// What v0.40 brought (still here):
 //
 // What's new vs v0.39:
 //   NNN. findBottleneck('land') now returns wanderer as the bottleneck-producer
@@ -446,7 +459,7 @@
 
   // ─── Bot ─────────────────────────────────────────────────────────────
   const Bot = {
-    version: '0.40',
+    version: '0.41',
     G: G,
     objective: 'tier-1 survival first, then QoL, then infrastructure',
 
@@ -703,19 +716,23 @@
 
       // v0.11: stockpile-aware food throttle. Decay scales with stockpile, so
       // when overstocked the marginal food worker adds spoilage, not nutrition.
+      // v0.41 fix: when overstocked, the throttle now takes the MIN of (current
+      // target, pop×fraction). Previously it used Math.max which UPGRADED the
+      // food worker count at large pop — pop 5000 × 0.10 = 500 gatherers when
+      // the original quota was only 119. This was crushing tier-2 budget.
       const foodAmount = (r.food && r.food.amount) || 0;
       const targetStockpile = pop * 30;  // 30 days of food at pop×1 consumption
       const fGather = floor.gatherer || 2, fHunt = floor.hunter || 2, fFish = floor.fisher || 1;
       if (foodAmount > targetStockpile * 2) {
-        // Way overstocked → drop to minimum
-        targets['gatherer'] = Math.max(fGather, Math.ceil(pop * 0.10));
-        targets['hunter']   = Math.max(fHunt,   Math.ceil(pop * 0.08));
-        targets['fisher']   = Math.max(fFish,   Math.ceil(pop * 0.08));
+        // Way overstocked → take MIN of current target and pop fraction (cap, not floor)
+        targets['gatherer'] = Math.max(fGather, Math.min(targets['gatherer'] || 9999, Math.ceil(pop * 0.10)));
+        targets['hunter']   = Math.max(fHunt,   Math.min(targets['hunter']   || 9999, Math.ceil(pop * 0.08)));
+        targets['fisher']   = Math.max(fFish,   Math.min(targets['fisher']   || 9999, Math.ceil(pop * 0.08)));
       } else if (foodAmount > targetStockpile) {
-        // Moderately overstocked
-        targets['gatherer'] = Math.max(fGather, Math.ceil(pop * 0.15));
-        targets['hunter']   = Math.max(fHunt,   Math.ceil(pop * 0.12));
-        targets['fisher']   = Math.max(fFish,   Math.ceil(pop * 0.12));
+        // Moderately overstocked — same cap logic
+        targets['gatherer'] = Math.max(fGather, Math.min(targets['gatherer'] || 9999, Math.ceil(pop * 0.15)));
+        targets['hunter']   = Math.max(fHunt,   Math.min(targets['hunter']   || 9999, Math.ceil(pop * 0.12)));
+        targets['fisher']   = Math.max(fFish,   Math.min(targets['fisher']   || 9999, Math.ceil(pop * 0.12)));
       }
 
       // Stash the raw quotas for debug / status surface.
