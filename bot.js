@@ -1,4 +1,15 @@
-// LegacyBot v0.37 — Reqs-gated tier-1 quotas (fresh-game deadlock fix).
+// LegacyBot v0.38 — Affordable-mode-count cap in multi-mode distribution.
+//
+// What's new vs v0.37:
+//   JJJ. distributeMultiInstanceModes now caps targetModeCount by what the
+//        workforce can actually fill: targetModeCount = min(useful modes,
+//        maxModesPerUnit, floor(totalAmount / minWorkersPerMode)).
+//        Previously with 17 artisans and 6 useful modes × 5 minWorkers = 30,
+//        the split was skipped entirely, so all artisans stayed in knap mode.
+//        Now 17 artisans split across floor(17/5)=3 modes (knap, knap-bone,
+//        stone-tools or whichever scores highest).
+//
+// What v0.37 brought (still here):
 //
 // What's new vs v0.36:
 //   III. computeTier1Targets now zeroes out quotas and floors for units whose
@@ -404,7 +415,7 @@
 
   // ─── Bot ─────────────────────────────────────────────────────────────
   const Bot = {
-    version: '0.37',
+    version: '0.38',
     G: G,
     objective: 'tier-1 survival first, then QoL, then infrastructure',
 
@@ -796,11 +807,17 @@
         }).filter(Boolean);
         if (allUseful.length < 2) continue;
         allUseful.sort((a, b) => b.score - a.score);
-        const targetModeCount = Math.min(allUseful.length, Bot.settings.maxModesPerUnit);
         // v0.25: base distribution on AMOUNT not max(amount, target) — prevents
         // feedback ballooning where each call inflates targets further.
         const totalTarget = instances.reduce((s, i) => s + i.amount, 0);
-        if (totalTarget < Bot.settings.minWorkersPerMode * targetModeCount) continue;
+        // v0.38: cap targetModeCount by what the workforce can actually fill.
+        // Previously a 17-artisan civ with 6 modes × minWorkersPerMode=5 needed
+        // 30 workers to split, so all 17 stayed in knap forever. Now we split
+        // into floor(totalTarget / minWorkersPerMode) modes max.
+        const affordableModes = Math.max(1, Math.floor(totalTarget / Math.max(1, Bot.settings.minWorkersPerMode)));
+        const targetModeCount = Math.min(allUseful.length, Bot.settings.maxModesPerUnit, affordableModes);
+        // Only skip if we can't even afford 2 modes (totalTarget < 2 × minWorkersPerMode)
+        if (targetModeCount < 2) continue;
         if (Bot.settings.autoSplit) {
           while (instances.length < targetModeCount) {
             try { G.splitUnit(instances[0], 1); instances = G.unitsOwned.filter(u => u.unit && u.unit.name === name); if (instances.length >= targetModeCount) break; } catch (e) { break; }
