@@ -1,4 +1,17 @@
-// LegacyBot v0.36 — Pyramid bottom-up optimizer for 10 essentials.
+// LegacyBot v0.37 — Reqs-gated tier-1 quotas (fresh-game deadlock fix).
+//
+// What's new vs v0.36:
+//   III. computeTier1Targets now zeroes out quotas and floors for units whose
+//        prerequisite techs aren't researched. v0.36 reserved 13 worker-slots
+//        for tier-1 floors (gatherer 2 + hunter 2 + fisher 1 + firekeeper 1 +
+//        clothier 1 + healer 1 + Syrup 1 + FA 1 + artisan 2 + architect 1) but
+//        at fresh-game pop=10 only gatherer was buildable. The other 12
+//        worker-slots were "reserved for tier-1" → ate the entire worker pool
+//        → tier-2 (dreamers) got 0 budget → no insight produced → no techs
+//        researched → eternal deadlock. Now floors gate by reqsMet() so the
+//        bot reserves capacity only for units it can actually build.
+//
+// What v0.36 brought (still here):
 //
 // What's new vs v0.35:
 //   AAA. buildCatalog now captures `provide` effects (e.type === 'provide')
@@ -391,7 +404,7 @@
 
   // ─── Bot ─────────────────────────────────────────────────────────────
   const Bot = {
-    version: '0.36',
+    version: '0.37',
     G: G,
     objective: 'tier-1 survival first, then QoL, then infrastructure',
 
@@ -544,49 +557,62 @@
       // v0.30: safety bonus is ABSOLUTE not pop-fraction. Was pop × 0.1 which
       // at pop 96k = 9690 extra workers, eating the entire tier-3 budget.
       const foodSafetyBonus = daysOfFood < 5 ? 200 : (daysOfFood < 15 ? 100 : (daysOfFood < 30 ? 50 : 0));
+      // v0.37: only count floors for units whose reqs are met. Otherwise the
+      // bot reserves worker-slots for unbuildable units, starving tier-2
+      // production and creating a deadlock at small pop (e.g. fresh game).
+      const reqsMetFor = (n) => {
+        const u = G.unit && G.unit.find(uu => uu.name === n);
+        return u ? Bot.reqsMet(u.req) : false;
+      };
+      const fGatherer = reqsMetFor('gatherer') ? (floor.gatherer || 0) : 0;
+      const fHunter   = reqsMetFor('hunter')   ? (floor.hunter   || 0) : 0;
+      const fFisher   = reqsMetFor('fisher')   ? (floor.fisher   || 0) : 0;
       const foodQuota = Math.max(
         Math.ceil(pop * set.foodQuotaFrac),
         foodConsumptionWorkers + foodSafetyBonus,
-        (floor.gatherer || 0) + (floor.hunter || 0) + (floor.fisher || 0)
+        fGatherer + fHunter + fFisher
       );
 
-      // ── WARMTH ──
+      // ── WARMTH ── (gated by firekeeper reqs)
       const firePitLost = (r['fire pit'] && r['fire pit'].lost) || 0;
-      const warmthQuota = Math.max(
+      const warmthQuota = reqsMetFor('firekeeper') ? Math.max(
         Math.ceil(pop * set.warmthQuotaFrac),
         Math.ceil((firePitLost * 1.2) / 0.2),
         floor.firekeeper || 1
-      );
+      ) : 0;
 
-      // ── CLOTHING ──
+      // ── CLOTHING ── (gated by clothier reqs)
       const clothing = ((r['primitive clothes'] && r['primitive clothes'].amount) || 0)
                      + ((r['basic clothes']     && r['basic clothes'].amount)     || 0);
       const clothingDeficit = Math.max(0, pop - clothing);
-      const clothingQuota = Math.max(
+      const clothingQuota = reqsMetFor('clothier') ? Math.max(
         Math.ceil(pop * set.clothingQuotaFrac),
         Math.ceil(clothingDeficit / 10),
         floor.clothier || 1
-      );
+      ) : 0;
 
-      // ── HEALING ──
+      // ── HEALING ── (gated by healer reqs)
       const sick    = (r.sick    && r.sick.amount)    || 0;
       const wounded = (r.wounded && r.wounded.amount) || 0;
       const healingPressure = Math.ceil((sick + wounded) / 2);
-      const healingQuota = Math.max(
+      const fHealer = reqsMetFor('healer') ? (floor.healer || 0) : 0;
+      const fSyrup  = reqsMetFor('Syrup healer') ? (floor['Syrup healer'] || 0) : 0;
+      const fFA     = reqsMetFor('First aid healer') ? (floor['First aid healer'] || 0) : 0;
+      const healingQuota = (fHealer + fSyrup + fFA) === 0 ? 0 : Math.max(
         Math.ceil(pop * set.healingQuotaFrac),
         healingPressure + 1,
-        (floor.healer || 0) + (floor['Syrup healer'] || 0) + (floor['First aid healer'] || 0)
+        fHealer + fSyrup + fFA
       );
 
-      // ── TOOLING (artisan: knapped tools — staffing requirement for ALL workers) ──
-      const toolingQuota = Math.max(
+      // ── TOOLING (artisan: knapped tools) ── (gated by artisan reqs)
+      const toolingQuota = reqsMetFor('artisan') ? Math.max(
         Math.ceil(pop * set.toolingQuotaFrac),
         Math.ceil(pop / 25),
         floor.artisan || 2
-      );
+      ) : 0;
 
-      // ── CIVIL (architect for housing capacity) ──
-      const civilQuota = Math.max(1, Math.ceil(pop / set.civilQuotaPer), floor.architect || 1);
+      // ── CIVIL (architect) ── (gated by architect reqs)
+      const civilQuota = reqsMetFor('architect') ? Math.max(1, Math.ceil(pop / set.civilQuotaPer), floor.architect || 1) : 0;
 
       // ── Total demand vs worker cap → proportional scale-down if needed ──
       const workerCap = (r.worker && r.worker.amount) || 0;
@@ -607,22 +633,22 @@
       const toolingScaled  = sc(toolingQuota);
       const civilScaled    = sc(civilQuota);
 
-      // ── Split food 40/30/30 ──
-      targets['gatherer'] = Math.max(floor.gatherer || 2, Math.ceil(foodScaled * 0.40));
-      targets['hunter']   = Math.max(floor.hunter   || 2, Math.ceil(foodScaled * 0.30));
-      targets['fisher']   = Math.max(floor.fisher   || 1, Math.ceil(foodScaled * 0.30));
+      // ── Split food 40/30/30 ── (each gated by its own reqs)
+      targets['gatherer'] = reqsMetFor('gatherer') ? Math.max(floor.gatherer || 2, Math.ceil(foodScaled * 0.40)) : 0;
+      targets['hunter']   = reqsMetFor('hunter')   ? Math.max(floor.hunter   || 2, Math.ceil(foodScaled * 0.30)) : 0;
+      targets['fisher']   = reqsMetFor('fisher')   ? Math.max(floor.fisher   || 1, Math.ceil(foodScaled * 0.30)) : 0;
 
-      // ── Single-unit sub-quotas ──
-      targets['firekeeper'] = warmthScaled;
-      targets['clothier']   = clothingScaled;
+      // ── Single-unit sub-quotas ── (warmthScaled/clothingScaled are 0 if reqs unmet)
+      targets['firekeeper'] = reqsMetFor('firekeeper') ? warmthScaled : 0;
+      targets['clothier']   = reqsMetFor('clothier')   ? clothingScaled : 0;
 
       // ── Split healing 50/30/20 ──
-      targets['healer']            = Math.max(floor.healer            || 1, Math.ceil(healingScaled * 0.50));
-      targets['Syrup healer']      = Math.max(floor['Syrup healer']   || 1, Math.ceil(healingScaled * 0.30));
-      targets['First aid healer']  = Math.max(floor['First aid healer'] || 1, Math.ceil(healingScaled * 0.20));
+      targets['healer']            = reqsMetFor('healer')            ? Math.max(floor.healer            || 1, Math.ceil(healingScaled * 0.50)) : 0;
+      targets['Syrup healer']      = reqsMetFor('Syrup healer')      ? Math.max(floor['Syrup healer']   || 1, Math.ceil(healingScaled * 0.30)) : 0;
+      targets['First aid healer']  = reqsMetFor('First aid healer')  ? Math.max(floor['First aid healer'] || 1, Math.ceil(healingScaled * 0.20)) : 0;
 
-      targets['artisan']   = toolingScaled;
-      targets['architect'] = civilScaled;
+      targets['artisan']   = reqsMetFor('artisan')   ? toolingScaled : 0;
+      targets['architect'] = reqsMetFor('architect') ? civilScaled   : 0;
 
       // v0.12: adaptive healing — double the healing pool if disease drains health.
       const healthLostBy = (r.health && r.health.lostBy) || [];
