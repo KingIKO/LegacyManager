@@ -1,4 +1,21 @@
-// LegacyBot v0.38 — Affordable-mode-count cap in multi-mode distribution.
+// LegacyBot v0.39 — Storage overflow detection and aggressive storage targets.
+//
+// What's new vs v0.38:
+//   KKK. Storage-overflow detection: any resource whose name contains 'storage'
+//        and is overflowing (used > amount × 0.9) flags its providing buildings
+//        (warehouse, barn, stockpile, storage pit, granary, Mana silo) as
+//        bottleneck-producers, AND boosts demand 5× for those buildings'
+//        cost resources (basic building materials, archaic building materials, etc.)
+//        Currently catches "material storage" at 12× overflow in observed game.
+//   LLL. Aggressive storage building targets — warehouse and barn moved from
+//        auto-expand (pop/1500) to hardcoded pop/100. Granary boosted pop/60→pop/50.
+//        Each warehouse provides +4000 material storage; each barn +4000 food.
+//   MMM. Removed the canAffordCost gate for buildings in doBuyTick. The check
+//        was blocking the bot from queueing storage pits when materials were
+//        low — exactly when more storage cap would FIX the material shortage.
+//        Queue is fine; the game only deducts when actually constructing.
+//
+// What v0.38 brought (still here):
 //
 // What's new vs v0.37:
 //   JJJ. distributeMultiInstanceModes now caps targetModeCount by what the
@@ -415,7 +432,7 @@
 
   // ─── Bot ─────────────────────────────────────────────────────────────
   const Bot = {
-    version: '0.38',
+    version: '0.39',
     G: G,
     objective: 'tier-1 survival first, then QoL, then infrastructure',
 
@@ -1047,6 +1064,33 @@
         }
       }
 
+      // v0.39: storage-overflow detection. Any resource named "X storage" or
+      // "added X storage" where used > amount means the civ is producing past
+      // its cap → materials decay. Flag the storage-providing buildings as
+      // bottleneck-producers so tier-3 weight + mode-pickers favor them.
+      Bot._lastStorageOverflow = {};
+      for (const resName in G.resByName) {
+        if (!/storage/i.test(resName)) continue;
+        const rr = G.resByName[resName];
+        if (!rr || !rr.amount) continue;
+        if (rr.used > rr.amount * 0.9) {
+          Bot._lastStorageOverflow[resName] = { amount: rr.amount, used: rr.used, ratio: (rr.used / rr.amount).toFixed(2) };
+          // Find providers via producerMap (units that "provide" this storage)
+          const providers = (Bot.producerMap['added ' + resName] || []).concat(Bot.producerMap[resName] || []);
+          for (const p of providers) {
+            if (p.unit) {
+              Bot._bottleneckProducers.add(p.unit);
+              // Boost demand on the building's COST resources so the bot
+              // prioritizes producing what's needed to build the storage.
+              const u = G.unit.find(uu => uu.name === p.unit);
+              if (u && u.cost) {
+                for (const ck in u.cost) d[ck] = Math.max(d[ck] || 0, (d[ck] || 50) * 5);
+              }
+            }
+          }
+        }
+      }
+
       return d;
     },
 
@@ -1169,9 +1213,14 @@
         const targets = {
           'hut': housingPerPop, 'hovel': housingPerPop, 'house': housingPerPop,
           'branch shelter': 4, 'mud shelter': 4,
+          // v0.39: aggressive storage targets — material storage overflow blocks
+          // production. warehouse +4000/each, barn +4000/each are the best
+          // bang-for-buck once "construction"/"carpentry" are researched.
           'storage pit': Math.max(2, Math.ceil(pop / 30)),
           'stockpile': Math.max(2, Math.ceil(pop / 50)),
-          'granary': Math.max(1, Math.ceil(pop / 60)),
+          'granary': Math.max(2, Math.ceil(pop / 50)),  // was pop/60
+          'warehouse': Math.max(2, Math.ceil(pop / 100)),  // was pop/1500 via auto-expand
+          'barn': Math.max(2, Math.ceil(pop / 100)),       // was pop/1500 via auto-expand
           'well': wellPerPop,
           'grave': burialPerPop,
           'Drying rack': Math.max(1, Math.ceil(pop / 40)),
@@ -1206,7 +1255,11 @@
           const totalQueued = instances.reduce((s, i) => s + i.targetAmount, 0);
           if (totalAmount >= totalTarget || totalQueued >= totalTarget) continue;
           const inst = instances[0];
-          if (!Bot.canAffordCost(inst.unit.cost)) continue;
+          // v0.39: no affordability gate for buildings — queue is fine, the game
+          // only deducts materials when actually constructing. Without this the
+          // bot wouldn't queue storage pits / warehouses when materials were
+          // low, even though those buildings are precisely the fix for material
+          // shortage (more storage cap = less decay = more materials).
           const landRes = G.resByName.land, ln = inst.unit.use.land || 0;
           if (landRes && (landRes.amount - landRes.used) < ln) continue;
           const delta = Math.min(3, totalTarget - totalQueued);
