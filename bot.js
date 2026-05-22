@@ -1,4 +1,26 @@
-// LegacyBot v0.41 — Food throttle inversion fix (was a CAP that acted as FLOOR).
+// LegacyBot v0.42 — Bottleneck descent + research-priority by bottleneck.
+//
+// What's new vs v0.41:
+//   RRR. New Bot._descendUnitBlocker(unitName) — given a unit the bot wants
+//        built but isn't, walks unit.req (techs), unit.use (staff + land),
+//        unit.cost (materials) to find the LOWEST broken layer. Returns the
+//        actual blocking resource/tech, not the symptom-level "build X".
+//   SSS. findBottleneck now descends via _descendUnitBlocker on:
+//        - producer-unbuilt (was: "no X for Y"; now: "X needs unresearched Z")
+//        - cap-unbuilt (was: "build Y"; now: "Y is cost-blocked on Z")
+//        - cap-unresearched (was: tech name; now: tech-prereq tech name if chain)
+//        These all carry a `tech: name` field when the actual block is a tech.
+//   TTT. doResearchTick prefers candidates whose name matches any current
+//        bottleneck's `tech` or `resource` field. Previously the bot would
+//        always pick by hardcoded techPriority; now if "fire-making" is the
+//        lowest broken layer for warmth and it's affordable, the bot
+//        researches it next regardless of fixed priorities.
+//   UUU. Goal alignment: every essential walks down to the deepest actionable
+//        broken node each tick, the bot's research/buy/mode loops are biased
+//        toward that node, and user-touched units stay untouched (via the
+//        per-instance signature system from v0.32-v0.34).
+//
+// What v0.41 brought (still here):
 //
 // What's new vs v0.40:
 //   QQQ. The v0.11 stockpile-aware food throttle was supposed to REDUCE food
@@ -459,7 +481,7 @@
 
   // ─── Bot ─────────────────────────────────────────────────────────────
   const Bot = {
-    version: '0.41',
+    version: '0.42',
     G: G,
     objective: 'tier-1 survival first, then QoL, then infrastructure',
 
@@ -1157,7 +1179,31 @@
     },
     policyTargets: {'food rations':'plentiful','water rations':'plentiful','eat spoiled food':'off','drink muddy water':'off','insects as food':'off','eat raw meat and fish':'off','child workforce':'off','elder workforce':'off','fertility rituals':'on','harvest rituals':'on','flower rituals':'on','wisdom rituals':'on','harvest rituals for flowers':'on','Gather roses':'on','population control':'normal'},
 
-    doResearchTick() { if (!Bot.settings.autoResearch) return; const t = Bot.pickByPriority(Bot.candidateTechs(), Bot.techPriority); if (!t) return; Bot.payCost(t.cost); G.gainTech(t); Bot.stats.techsResearched++; },
+    doResearchTick() {
+      if (!Bot.settings.autoResearch) return;
+      // v0.42: prefer techs that resolve current essential bottlenecks.
+      // If any essential's bottleneck is a tech name (cap-unresearched,
+      // unit-reqs-tech, etc.), research THAT first instead of the hardcoded
+      // techPriority order. The bottleneck IS the lowest broken layer.
+      const cands = Bot.candidateTechs();
+      if (!cands.length) return;
+      const bnTechs = new Set();
+      if (Bot._lastBottlenecks) {
+        for (const ess in Bot._lastBottlenecks) {
+          const bn = Bot._lastBottlenecks[ess];
+          if (bn && bn.tech) bnTechs.add(bn.tech);
+          // Also catch cap-unresearched / cap-unresearched-prereq / unit-reqs-tech
+          if (bn && bn.resource && G.tech.some(t => t.name === bn.resource) && !G.techsOwnedNames.includes(bn.resource)) {
+            bnTechs.add(bn.resource);
+          }
+        }
+      }
+      // First try bottleneck techs that are candidates (affordable + reqs met)
+      const bnAvail = cands.filter(t => bnTechs.has(t.name));
+      const t = bnAvail.length ? Bot.pickByPriority(bnAvail, Bot.techPriority) : Bot.pickByPriority(cands, Bot.techPriority);
+      if (!t) return;
+      Bot.payCost(t.cost); G.gainTech(t); Bot.stats.techsResearched++;
+    },
     doTraitTick() { if (!Bot.settings.autoTrait) return; const t = Bot.pickByPriority(Bot.candidateTraits(), Bot.traitPriority); if (!t) return; Bot.payCost(t.cost); G.gainTrait(t); Bot.stats.traitsAcquired++; },
     doPolicyTick() { if (!Bot.settings.autoPolicy) return; for (const name in Bot.policyTargets) { const target = Bot.policyTargets[name]; const p = G.policyByName[name]; if (!p || !p.visible || !Bot.reqsMet(p.req)) continue; if (p.mode && p.mode.id === target) continue; let tm = null; for (const m of (p.modesById || [])) if (m && m.id === target) { tm = m; break; } if (!tm) continue; try { G.setPolicyMode(p, tm); Bot.stats.policiesChanged++; } catch (e) {} } },
 
@@ -1637,7 +1683,51 @@
       return Bot.essentialChains;
     },
 
-    // Walk the chain to find the FIRST bottleneck.
+    // v0.42: given a unit name that the bot wants built but isn't, descend
+    // into the unit's cost/staff/upkeep to find the LOWEST broken layer.
+    // Returns { resource, kind, why } or null if no clear blocker.
+    _descendUnitBlocker(unitName, depth, visited) {
+      if (depth > 5) return null;
+      const u = G.unit && G.unit.find(uu => uu.name === unitName);
+      if (!u) return null;
+      // Tech requirement?
+      if (u.req) {
+        for (const k in u.req) {
+          if (u.req[k] === true && !G.techsOwnedNames.includes(k) && !G.traitsOwnedNames.includes(k)) {
+            return { resource: k, tech: k, kind: 'unit-reqs-tech', severity: 'medium', why: `${unitName} requires unresearched tech: ${k}` };
+          }
+        }
+      }
+      // Staff resources short? (use.X where X != worker, X != land)
+      if (u.use) {
+        for (const k in u.use) {
+          if (k === 'worker' || k === 'land') continue;
+          const rr = G.resByName[k];
+          if (!rr) continue;
+          if ((rr.amount || 0) - (rr.used || 0) < (u.use[k] || 0)) {
+            // recurse into the staff resource's bottleneck
+            const sub = Bot.findBottleneck(k, depth + 1, visited);
+            if (sub) return Object.assign({}, sub, { kind: 'unit-staff-chain', via: unitName });
+            return { resource: k, kind: 'unit-staff-short', severity: 'medium', why: `${unitName} short on staff resource: ${k}` };
+          }
+        }
+      }
+      // Cost resources short?
+      if (u.cost) {
+        for (const k in u.cost) {
+          const rr = G.resByName[k];
+          if (!rr) continue;
+          if ((rr.amount || 0) < (u.cost[k] || 0)) {
+            const sub = Bot.findBottleneck(k, depth + 1, visited);
+            if (sub) return Object.assign({}, sub, { kind: 'unit-cost-chain', via: unitName });
+            return { resource: k, kind: 'unit-cost-short', severity: 'medium', why: `${unitName} cost-blocked by: ${k}` };
+          }
+        }
+      }
+      return null;
+    },
+
+    // Walk the chain to find the LOWEST broken layer (v0.42).
     // Returns { essential, resource, kind, severity, why } or null if no issue.
     findBottleneck(essentialName, depth = 0, visited = new Set()) {
       if (depth > 5 || visited.has(essentialName)) return null;
@@ -1684,7 +1774,9 @@
           const insts = G.unitsOwned.filter(u => u.unit && u.unit.name === p.unit);
           const totalAmt = insts.reduce((s,i)=>s+i.amount,0);
           if (totalAmt === 0) {
-            // Producer not built — recurse into its requirements (likely a tech blocker)
+            // v0.42: descend into WHY the producer can't be built
+            const deeper = Bot._descendUnitBlocker(p.unit, depth + 1, visited);
+            if (deeper) return Object.assign({}, deeper, { essential: essentialName, kind: 'producer-unbuilt-chain' });
             return { essential: essentialName, resource: p.unit, kind: 'producer-unbuilt', severity: 'medium', why: `no ${p.unit} built for ${essentialName}` };
           }
           // If mode required and not currently active anywhere, that's the issue
@@ -1704,13 +1796,25 @@
       if (chainSh && chainSh.capProviders && depth > 0) {
         for (const p of chainSh.capProviders) {
           if (p.tech && !p.owned) {
-            return { essential: essentialName, resource: p.tech, kind: 'cap-unresearched', severity: 'medium', why: `tech ${p.tech} would raise ${essentialName}` };
+            // v0.42: tech cap-provider — check if its req-chain has unmet techs
+            const techObj = G.tech && G.tech.find(t => t.name === p.tech);
+            if (techObj && techObj.req) {
+              for (const rk in techObj.req) {
+                if (techObj.req[rk] === true && !G.techsOwnedNames.includes(rk) && !G.traitsOwnedNames.includes(rk)) {
+                  return { essential: essentialName, resource: rk, tech: rk, kind: 'cap-unresearched-prereq', severity: 'medium', why: `prereq tech ${rk} needed before ${p.tech} can raise ${essentialName}` };
+                }
+              }
+            }
+            return { essential: essentialName, resource: p.tech, tech: p.tech, kind: 'cap-unresearched', severity: 'medium', why: `tech ${p.tech} would raise ${essentialName}` };
           }
           if (p.unit) {
             const insts = G.unitsOwned.filter(u => u.unit && u.unit.name === p.unit);
             const totalAmt = insts.reduce((s,i)=>s+i.amount,0);
             const u = G.unit.find(uu => uu.name === p.unit);
             if (totalAmt === 0 && u && Bot.reqsMet(u.req)) {
+              // v0.42: descend into WHY this cap-providing unit isn't being built
+              const deeper = Bot._descendUnitBlocker(p.unit, depth + 1, visited);
+              if (deeper) return Object.assign({}, deeper, { essential: essentialName, kind: 'cap-unbuilt-chain' });
               return { essential: essentialName, resource: p.unit, kind: 'cap-unbuilt', severity: 'medium', why: `building ${p.unit} would raise ${essentialName}` };
             }
           }
