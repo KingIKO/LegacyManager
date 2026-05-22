@@ -1,4 +1,21 @@
-// LegacyBot v0.42 — Bottleneck descent + research-priority by bottleneck.
+// LegacyBot v0.43 — Cap-resource descent at depth 0 + cap-grow recommendations.
+//
+// What's new vs v0.42:
+//   VVV. Removed the `depth > 0` gate on the shadow-cap provider check.
+//        wisdom/inspiration/spirituality/authority are called at depth 0 from
+//        the top-level loop; gating their proposals meant findBottleneck('wisdom')
+//        always returned null, so insight cap-saturation went unaddressed.
+//   WWW. When cap-saturated falls through with `sub = null`, the bot now
+//        proposes "build more of an existing cap-providing unit" via cap-grow.
+//        Previously the return was "X capped at Y" with no next step. Now
+//        it descends into the cap-provider's unit blockers and returns the
+//        deepest broken layer (could be tech research, staff resource, etc.).
+//   XXX. Goal alignment: every cap-saturated essential now produces an
+//        actionable bottleneck. wisdom-cap → "build more Wizard". Wizard
+//        blocked by Wand → descend into artisan/Craftwands mode → recurse
+//        into knapped tools → into stone → into digger reqs → until leaf.
+//
+// What v0.42 brought (still here):
 //
 // What's new vs v0.41:
 //   RRR. New Bot._descendUnitBlocker(unitName) — given a unit the bot wants
@@ -481,7 +498,7 @@
 
   // ─── Bot ─────────────────────────────────────────────────────────────
   const Bot = {
-    version: '0.42',
+    version: '0.43',
     G: G,
     objective: 'tier-1 survival first, then QoL, then infrastructure',
 
@@ -1742,6 +1759,27 @@
           // Recurse into the cap resource — what's blocking IT from growing?
           const sub = Bot.findBottleneck(capLimit, depth + 1, visited);
           if (sub) return Object.assign({}, sub, { essential: essentialName, kind: 'cap-chain' });
+          // v0.43: sub returned null — try harder. Look at the cap resource's
+          // capProviders and propose building more of the existing unit-providers
+          // (Wizard for wisdom, Wizard Complex for inspiration, etc.). Even if
+          // some are built, recommending more is the right call.
+          const capChain = Bot.essentialChains && Bot.essentialChains[capLimit];
+          if (capChain && capChain.capProviders) {
+            for (const p of capChain.capProviders) {
+              if (p.unit) {
+                const u = G.unit.find(uu => uu.name === p.unit);
+                if (u && Bot.reqsMet(u.req)) {
+                  // Descend into why this unit isn't being built more
+                  const deeper = Bot._descendUnitBlocker(p.unit, depth + 1, visited);
+                  if (deeper) return Object.assign({}, deeper, { essential: essentialName, kind: 'cap-grow-chain', via: p.unit });
+                  return { essential: essentialName, resource: p.unit, producer: p.unit, kind: 'cap-grow', severity: 'medium', why: `build more ${p.unit} to raise ${capLimit} and unblock ${essentialName}` };
+                }
+              }
+              if (p.tech && !p.owned) {
+                return { essential: essentialName, resource: p.tech, tech: p.tech, kind: 'cap-grow-tech', severity: 'medium', why: `research ${p.tech} to raise ${capLimit} and unblock ${essentialName}` };
+              }
+            }
+          }
           return { essential: essentialName, resource: capLimit, kind: 'cap-saturated', severity: 'high', why: `${essentialName} capped at ${capLimit}` };
         }
       }
@@ -1792,8 +1830,13 @@
       // v0.36 wiki refinement: for shadow caps (inspiration/spirituality/
       // authority) that are NOT net-negative and NOT capped, check if there's
       // an unbuilt cap-provider that would raise this cap. If yes, propose it.
+      // v0.43: removed `depth > 0` gate. Shadow-cap essentials (wisdom,
+      // inspiration, spirituality, authority) are called at depth 0 from the
+      // top-level loop AND at depth 1+ from cap-saturated parents. In both
+      // cases we want to propose more cap providers if their amount isn't
+      // already maxed out by everything researchable/buildable.
       const chainSh = Bot.essentialChains && Bot.essentialChains[essentialName];
-      if (chainSh && chainSh.capProviders && depth > 0) {
+      if (chainSh && chainSh.capProviders) {
         for (const p of chainSh.capProviders) {
           if (p.tech && !p.owned) {
             // v0.42: tech cap-provider — check if its req-chain has unmet techs
